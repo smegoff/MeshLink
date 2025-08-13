@@ -1,27 +1,17 @@
-# User Guide
+# MeshMini — User Guide
 
-Welcome to **MeshLink BBS** — a lightweight Meshtastic BBS.
+**Quick menu**: send `?` from your Meshtastic device.
 
-## Basics
-- Send `?` for the quick menu (notice page first if set).
-- Send `??` for the full help.
-- Post: `p <text>`
-- Read list: `r`
-- Read one: `r <id>`
-- Reply: `reply <id> <text>`
+### Commands
+- `r` — list recent posts
+- `r <id>` — read a post
+- `p <text>` — make a new post
+- `reply <id> <text>` — reply to a post
+- `info` — show the notice (if set)
+- `status` — node long name / short name / uptime
+- `whoami` — your ID and names
+- `whois <short>` — look up a node by short name
+- `nodes` — list nearby nodes
+- `dm <short> <text>` — queue a DM; it delivers when the node is next seen
 
-## Direct Messages (Store & Forward)
-- Send: `msg <short|!id> <text>`
-- If the node is online, you’ll see `Delivered…`.
-- If offline, you’ll get `Queued (Q#…)` — delivery will be retried when the node is heard.
-- Check your pending messages with `outbox`.
-
-## Who’s who
-- `whoami` — your node ID + long/short names (if known)
-- `whois <short|!id>` — lookup for a node
-- `lastseen <short|!id>` — how long since last heard
-- `nodes` — what the BBS currently knows
-
-## Notice
-- If the operator has set a notice, it is shown before the menu.
-- You can always read it again with `info`.
+**Help**: send `??`.

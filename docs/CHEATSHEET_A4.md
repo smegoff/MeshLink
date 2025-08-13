@@ -1,19 +1,17 @@
-# MeshLink BBS Cheatsheet (A4)
+# MeshMini — Cheatsheet (A4)
 
-Menu
-- `?` quick menu (notice first)
-- `??` full help
+`?` menu · `??` help
 
-Posts
-- `p <text>` · `r` · `r <id>` · `reply <id> <t>`
+**User**
+- `r` · `r <id>`
+- `p <text>` · `reply <id> <text>`
+- `info` · `status`
+- `whoami` · `whois <short>` · `nodes`
+- `dm <short> <text>` (queued if offline)
 
-DM (Store & Forward)
-- `msg <short|!id> <t>` · `outbox`
-
-Discovery
-- `whoami` · `whois <q>` · `lastseen <q>` · `nodes`
-
-Admin
-- `admins` · `admins add/remove !id` · `admins clear`
-- `blacklist` · `blacklist add/remove !id` · `blacklist clear`
-- `info` · `info set <t>` · `name` · `name set <t>`
+**Admin**
+- `admins add|del <!id>` · `admins list`
+- `bl add|del <!id>` · `bl list`
+- `peer add|del <!id>` · `peer list`
+- `sync now|on|off`
+- `info set <text>`
