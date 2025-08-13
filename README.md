@@ -1,4 +1,4 @@
-# MeshMini — Minimal Meshtastic BBS (Generic)
+# MeshLink — Minimal Meshtastic BBS (Generic)
 
 A tiny, reliable BBS for a Raspberry Pi connected via USB to a Meshtastic node.
 
