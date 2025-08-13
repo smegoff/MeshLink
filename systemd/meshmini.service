@@ -1,0 +1,34 @@
+# Sample unit (installed by install.sh)
+[Unit]
+Description=MeshMini - minimal Meshtastic BBS
+After=network.target
+
+[Service]
+Type=simple
+User=%i
+Group=%i
+WorkingDirectory=/opt/meshmini
+
+# Runtime config
+Environment="PYTHONUNBUFFERED=1"
+Environment="MMB_DB=/opt/meshmini/board.db"
+Environment="MMB_DEVICE=auto"
+Environment="MMB_NAME=MeshLink BBS"
+# comma-separated list of !ids
+# Environment="MMB_ADMINS=!deadbeef,!cafef00d"
+
+# Behavior knobs
+Environment="MMB_RATE=8"
+Environment="MMB_CH_FALLBACK=0"
+Environment="MMB_REPLY_BCAST=0"
+Environment="MMB_DIRECT_FALLBACK=0"
+Environment="MMB_FALLBACK_SEC=5"
+Environment="MMB_MAX_TEXT=110"
+Environment="MMB_TX_GAP=1.5"
+
+ExecStart=/opt/meshmini/venv/bin/python /opt/meshmini/meshmini.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
