@@ -1,110 +1,103 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Defaults
 USER_NAME=""
 DEVICE="auto"
 NAME="MeshLink BBS"
 ADMINS=""
-PYTHON_BIN="python3"
-PIP_FLAGS="--no-cache-dir"
+PEERS=""
 
 usage() {
   cat <<EOF
-Usage: sudo bash install.sh [--user <name>] [--device <auto|/dev/...>] [--name "BBS Name"] [--admins "!id,!id"]
+Usage: sudo bash install.sh --user <username> [--device auto|/dev/ttyACM0] [--name "MeshLink BBS"] [--admins "!deadbeef,!cafef00d"] [--peers "!11111111,!22222222"]
+
+Installs MeshMini to /opt/meshmini and sets up a systemd service.
 EOF
 }
 
-require_root() {
-  if [[ $EUID -ne 0 ]]; then
-    echo "Please run as root (sudo)." >&2
-    exit 1
-  fi
-}
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --user)   USER_NAME="$2"; shift 2;;
+    --device) DEVICE="$2"; shift 2;;
+    --name)   NAME="$2"; shift 2;;
+    --admins) ADMINS="$2"; shift 2;;
+    --peers)  PEERS="$2"; shift 2;;
+    -h|--help) usage; exit 0;;
+    *) echo "Unknown arg: $1"; usage; exit 1;;
+  esac
+done
 
-parse_args() {
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --user) USER_NAME="$2"; shift 2;;
-      --device) DEVICE="$2"; shift 2;;
-      --name) NAME="$2"; shift 2;;
-      --admins) ADMINS="$2"; shift 2;;
-      -h|--help) usage; exit 0;;
-      *) echo "Unknown arg: $1" >&2; usage; exit 1;;
-    esac
-  done
-  if [[ -z "${USER_NAME}" ]]; then
-    echo "--user is required" >&2
-    exit 1
-  fi
-}
+if [[ -z "${USER_NAME}" ]]; then
+  echo "Missing --user"; usage; exit 1
+fi
 
-ensure_user() {
-  id -u "$USER_NAME" >/dev/null 2>&1 || { echo "User $USER_NAME not found"; exit 1; }
-}
+# Paths
+APP_DIR=/opt/meshmini
+VENV=${APP_DIR}/venv
+PY=${VENV}/bin/python
+PIP=${VENV}/bin/pip
 
-setup_appdir() {
-  install -d -o "$USER_NAME" -g "$USER_NAME" /opt/meshmini
-  install -m 0755 meshmini.py /opt/meshmini/meshmini.py
-  chown "$USER_NAME:$USER_NAME" /opt/meshmini/meshmini.py
-}
+# Create app dir and venv
+mkdir -p "${APP_DIR}"
+cp meshmini.py "${APP_DIR}/meshmini.py"
+python3 -m venv "${VENV}"
+"${PIP}" install --upgrade pip
+"${PIP}" install meshtastic pypubsub
 
-setup_venv() {
-  if [[ ! -d /opt/meshmini/venv ]]; then
-    sudo -u "$USER_NAME" $PYTHON_BIN -m venv /opt/meshmini/venv
-  fi
-  /opt/meshmini/venv/bin/python -m pip install -U pip $PIP_FLAGS
-  /opt/meshmini/venv/bin/pip install meshtastic pypubsub $PIP_FLAGS
-}
+# Ownership
+chown -R "${USER_NAME}:${USER_NAME}" "${APP_DIR}"
 
-write_unit() {
-  UNIT_PATH="/etc/systemd/system/meshmini.service"
-  cat > "$UNIT_PATH" <<EOF
+# Systemd unit
+SERVICE=/etc/systemd/system/meshmini.service
+cat >/tmp/meshmini.service <<"UNIT"
 [Unit]
-Description=MeshMini - minimal Meshtastic BBS
+Description=MeshMini - minimal Meshtastic BBS (with peer sync)
 After=network.target
 
 [Service]
 Type=simple
-User=$USER_NAME
-Group=$USER_NAME
+User=__USER__
+Group=__USER__
 WorkingDirectory=/opt/meshmini
-Environment="PYTHONUNBUFFERED=1"
-Environment="MMB_DB=/opt/meshmini/board.db"
-Environment="MMB_DEVICE=$DEVICE"
-Environment="MMB_NAME=$NAME"
-Environment="MMB_ADMINS=$ADMINS"
-Environment="MMB_RATE=8"
-Environment="MMB_CH_FALLBACK=0"
-Environment="MMB_REPLY_BCAST=0"
-Environment="MMB_DIRECT_FALLBACK=0"
-Environment="MMB_FALLBACK_SEC=5"
-Environment="MMB_MAX_TEXT=110"
-Environment="MMB_TX_GAP=1.5"
+
+# Runtime config
+Environment=PYTHONUNBUFFERED=1
+Environment=MMB_DB=/opt/meshmini/board.db
+Environment=MMB_DEVICE=__DEVICE__
+Environment=MMB_NAME=__NAME__
+Environment=MMB_ADMINS=__ADMINS__
+Environment=MMB_PEERS=__PEERS__
+Environment=MMB_SYNC=1
+Environment=MMB_RATE=2
+Environment=MMB_CH_FALLBACK=0
+Environment=MMB_REPLY_BCAST=0
+Environment=MMB_DIRECT_FALLBACK=0
+Environment=MMB_FALLBACK_SEC=5
+Environment=MMB_MAX_TEXT=140
+Environment=MMB_TX_GAP=1.0
+
 ExecStart=/opt/meshmini/venv/bin/python /opt/meshmini/meshmini.py
 Restart=always
 RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
-EOF
-}
+UNIT
 
-enable_start() {
-  systemctl daemon-reload
-  systemctl enable meshmini.service
-  systemctl restart meshmini.service
-  systemctl status meshmini.service --no-pager || true
-}
+# Fill placeholders
+sed -i "s#__USER__#${USER_NAME}#g" /tmp/meshmini.service
+sed -i "s#__DEVICE__#${DEVICE}#g" /tmp/meshmini.service
+sed -i "s#__NAME__#${NAME//\//\\/}#g" /tmp/meshmini.service
+sed -i "s#__ADMINS__#${ADMINS//\//\\/}#g" /tmp/meshmini.service
+sed -i "s#__PEERS__#${PEERS//\//\\/}#g" /tmp/meshmini.service
 
-main() {
-  require_root
-  parse_args "$@"
-  ensure_user
-  setup_appdir
-  setup_venv
-  write_unit
-  enable_start
-  echo
-  echo "Done. Send '?' from a node to see the menu."
-}
-main "$@"
+install -m 0644 /tmp/meshmini.service "${SERVICE}"
+rm -f /tmp/meshmini.service
+
+# Enable & start
+systemctl daemon-reload
+systemctl enable meshmini.service
+systemctl restart meshmini.service
+
+echo "Installed. journalctl -u meshmini -f to watch logs."
