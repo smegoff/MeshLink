@@ -1,7 +1,7 @@
 
 ---
 
-## 3) `RELEASE_NOTES.md`
+## `RELEASE_NOTES.md`
 
 ```markdown
 # MeshMini Release Notes
