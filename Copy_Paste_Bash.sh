@@ -1,20 +1,26 @@
 sudo tee /opt/meshmini/meshmini.py >/dev/null <<'PY'
 #!/usr/bin/env python3
-# MeshMini — minimal Meshtastic BBS with peer sync (v0.8.6)
+# MeshMini — minimal Meshtastic BBS with peer sync (v0.8.9)
 # - Compact one-line '?' menu (auto-shrinks to fit MAX_TEXT)
-# - Notice (if set) sent first, as its own message
+# - Notice (if set) sent first, as its own page, with Pacific/Auckland timestamp
 # - Robust text decoding (bytes/str)
 # - PubSub backup for receive path (if pypubsub available)
 # - RX watchdog: auto-reconnect if no packets for a while
 # - Store-&-forward DMs (by shortName)
 # - Simple peer sync (inventory + chunked post replication)
 # - SQLite persistence; admin + blacklist; health
-# - FIX: 'nodes' tolerates string/int keys & empty primary map; falls back gracefully
+# - Nodes command tolerant of string/int keys and empty primary map
+# - 'info' command works case/whitespace-insensitively and is rate-limit bypassed
 
 import os, sys, time, sqlite3, threading, random, string
 from datetime import datetime
 from typing import List, Optional
 from collections import deque
+
+try:
+    from zoneinfo import ZoneInfo  # stdlib (Py3.9+)
+except Exception:
+    ZoneInfo = None
 
 # --- Meshtastic imports ---
 try:
@@ -36,15 +42,15 @@ DB_PATH       = os.environ.get("MMB_DB", "/opt/meshmini/board.db")
 DEVICE_PATH   = os.environ.get("MMB_DEVICE", "auto")
 BBS_NAME      = os.environ.get("MMB_NAME", "MeshLink BBS")
 ADMINS_CSV    = os.environ.get("MMB_ADMINS", "")
-RATE_SEC      = float(os.environ.get("MMB_RATE", "2"))             # per-sender rate limit
-CH_FALLBACK   = int(os.environ.get("MMB_CH_FALLBACK", "0"))        # reserved for future
-REPLY_BCAST   = int(os.environ.get("MMB_REPLY_BCAST", "0"))        # reserved for future
-DIRECT_FB     = int(os.environ.get("MMB_DIRECT_FALLBACK", "0"))    # reserved for future
+RATE_SEC      = float(os.environ.get("MMB_RATE", "2"))
+CH_FALLBACK   = int(os.environ.get("MMB_CH_FALLBACK", "0"))
+REPLY_BCAST   = int(os.environ.get("MMB_REPLY_BCAST", "0"))
+DIRECT_FB     = int(os.environ.get("MMB_DIRECT_FALLBACK", "0"))
 FB_WAIT       = float(os.environ.get("MMB_FALLBACK_SEC", "5"))
 MAX_TEXT      = int(os.environ.get("MMB_MAX_TEXT", "140"))
 TX_GAP        = float(os.environ.get("MMB_TX_GAP", "1.0"))
-HEALTH_PUBLIC = int(os.environ.get("MMB_HEALTH_PUBLIC", "0"))      # 1 => health visible to all
-DEBUG_LOG     = int(os.environ.get("MMB_DEBUG", "0"))              # 1 => verbose logs
+HEALTH_PUBLIC = int(os.environ.get("MMB_HEALTH_PUBLIC", "0"))
+DEBUG_LOG     = int(os.environ.get("MMB_DEBUG", "0"))
 
 # Peer sync knobs
 SYNC_ON      = int(os.environ.get("MMB_SYNC", "1"))
@@ -55,7 +61,7 @@ CHUNK_BYTES  = int(os.environ.get("MMB_SYNC_CHUNK", "160"))
 SYNC_TAG     = "#SYNC"
 
 # Watchdog knobs
-RX_STALE_SEC = int(os.environ.get("MMB_RX_STALE_SEC", "240"))      # reconnect if no RX for N seconds
+RX_STALE_SEC = int(os.environ.get("MMB_RX_STALE_SEC", "240"))
 WATCH_TICK   = int(os.environ.get("MMB_WATCH_TICK", "10"))
 
 def now() -> int: return int(time.time())
@@ -63,6 +69,18 @@ def gen_uid(n=10): return ''.join(random.choice(string.ascii_lowercase + string.
 def fmt_uptime(seconds:int) -> str:
     h = seconds // 3600; m = (seconds % 3600) // 60
     return f"{h}h{m:02d}m"
+
+def nz_time_str(ts: Optional[int] = None) -> str:
+    """Format timestamp in Pacific/Auckland; fall back to UTC if zoneinfo unavailable."""
+    ts = now() if ts is None else int(ts)
+    try:
+        if ZoneInfo:
+            dt = datetime.fromtimestamp(ts, tz=ZoneInfo("Pacific/Auckland"))
+            return dt.strftime("%Y-%m-%d %H:%M %Z")
+    except Exception:
+        pass
+    # Fallback: UTC
+    return datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M UTC")
 
 def dlog(msg: str):
     if DEBUG_LOG:
@@ -106,6 +124,7 @@ class MiniBBS:
         cur.execute("CREATE TABLE IF NOT EXISTS applied_uids (uid TEXT PRIMARY KEY, ts INTEGER)")
         cur.execute("CREATE TABLE IF NOT EXISTS rxparts (uid TEXT PRIMARY KEY, total INTEGER, got INTEGER, data TEXT, from_id TEXT, created_ts INTEGER)")
         cur.execute("CREATE TABLE IF NOT EXISTS dm_out (id INTEGER PRIMARY KEY, to_id TEXT, body TEXT, created_ts INTEGER, delivered_ts INTEGER)")
+        # Notice timestamp (if missing) will be added on first set
         self.db.commit()
 
     # ---------- Serial connect ----------
@@ -157,11 +176,9 @@ class MiniBBS:
         if not pub:
             dlog("[meshmini] PubSub not available; relying on onReceive only")
             return
-        # Unsubscribe (in case of reconnect)
         for topic in ("meshtastic.receive", "meshtastic.receive.text"):
             try: pub.unsubscribe(self._on_pub_receive, topic)
             except Exception: pass
-        # Subscribe
         try:
             pub.subscribe(self._on_pub_receive, "meshtastic.receive")
             pub.subscribe(self._on_pub_receive, "meshtastic.receive.text")
@@ -178,6 +195,17 @@ class MiniBBS:
         self._on_receive(packet, interface)
 
     # ---------- Helpers ----------
+    def _canon_nodeid(self, maybe_fromId, packet) -> Optional[str]:
+        if isinstance(maybe_fromId, str) and maybe_fromId.startswith("!"):
+            return maybe_fromId
+        src = packet.get("from")
+        if isinstance(src, int):
+            return f"!{src & 0xffffffff:08x}"
+        alt = packet.get("fromId")
+        if isinstance(alt, str):
+            return alt
+        return None
+
     def _nodeid_to_num(self, nid: str) -> Optional[int]:
         try:
             if nid and nid.startswith("!"):
@@ -198,28 +226,18 @@ class MiniBBS:
             return ("","")
 
     def _key_to_nodeid(self, key, entry) -> str:
-        """
-        Convert various node key formats (int, hex str, '!hex', dict fields)
-        into a canonical '!xxxxxxxx' lowercased string.
-        """
-        # Case 1: integer key
         if isinstance(key, int):
             return f"!{key & 0xffffffff:08x}"
-
-        # Case 2: string key
         if isinstance(key, str):
             s = key.strip()
             if s.startswith("!"):
                 return s.lower()
-            # try hex
             try:
                 return f"!{int(s, 16) & 0xffffffff:08x}"
             except Exception:
                 pass
-
-        # Case 3: look inside the entry for common fields
         if isinstance(entry, dict):
-            for fld in ("num", "nodeNum", "node_id", "nodeId", "id"):
+            for fld in ("num","nodeNum","node_id","nodeId","id"):
                 v = entry.get(fld)
                 if isinstance(v, int):
                     return f"!{v & 0xffffffff:08x}"
@@ -231,43 +249,26 @@ class MiniBBS:
                         return f"!{int(sv, 16) & 0xffffffff:08x}"
                     except Exception:
                         pass
-
-        # Fallback
         return "!?unknown"
 
     def _iter_nodes(self):
-        """
-        Yield (key, entry) pairs from whatever node map the library exposes.
-        Tries several known attributes; if all empty, yields just 'self' node if available.
-        """
-        # 1) Primary map
         nd = getattr(self.iface, "nodes", None)
         if isinstance(nd, dict) and nd:
             for k, v in nd.items():
                 yield (k, v)
             return
-
-        # 2) Alternate internal maps some versions keep
         for attr in ("nodesByNum", "_nodesByNum", "_nodes"):
             alt = getattr(self.iface, attr, None)
             if isinstance(alt, dict) and alt:
                 for k, v in alt.items():
                     yield (k, v)
                 return
-
-        # 3) As a last resort, expose our own node so 'nodes' isn't empty
         try:
             info = self.iface.getMyNodeInfo()
-            mynum = (info.get("my_node_num")
-                     or info.get("num")
-                     or info.get("nodeNum"))
-            entry = {
-                "user": {
-                    "shortName": info.get("shortName","") or (info.get("owner") or ""),
-                    "longName":  info.get("longName","")  or (info.get("owner") or ""),
-                },
-                "num": mynum
-            }
+            mynum = (info.get("my_node_num") or info.get("num") or info.get("nodeNum"))
+            entry = {"user": {"shortName": info.get("shortName","") or (info.get("owner") or ""),
+                              "longName":  info.get("longName","")  or (info.get("owner") or "")},
+                     "num": mynum}
             if mynum is not None:
                 yield (mynum, entry)
         except Exception:
@@ -278,7 +279,7 @@ class MiniBBS:
         if not self.iface: return
         text = text.strip()
         try:
-            if dest and dest.startswith("!"):
+            if dest and isinstance(dest, str) and dest.startswith("!"):
                 dlog(f"[send] -> {dest} ch=0: {text}")
                 self.iface.sendText(text, destinationId=dest)
             else:
@@ -305,11 +306,6 @@ class MiniBBS:
 
     # ---------- UI ----------
     def _menu_text(self) -> str:
-        """
-        Return a single-line compact menu, guaranteed to fit in MAX_TEXT.
-        If needed, it progressively removes less-critical items to stay under budget.
-        """
-        # Header (trim name if it's absurdly long)
         name = BBS_NAME.strip()
         if len(name) > 28:
             words = name.split()
@@ -317,54 +313,44 @@ class MiniBBS:
                 name = f"{words[0]} {' '.join(w[0] for w in words[1:])}"
             name = name[:28].rstrip()
         header = f"[{name}]"
-
-        parts = [
-            "r list", "r <id> read", "p <text> post", "reply <id> <t>",
-            "info", "status", "whoami", "nodes", "whois <short>", "dm <short> <t>", "?? help",
-        ]
-
+        parts = ["r list","r <id> read","p <text> post","reply <id> <t>","info","status","whoami","nodes","whois <short>","dm <short> <t>","?? help"]
         def join_line(items): return f"{header} " + " | ".join(items)
-
         line = join_line(parts)
         if len(line) <= MAX_TEXT: return line
-
-        removable_order = [
-            "dm <short> <t>", "whois <short>", "nodes", "whoami",
-            "status", "info", "reply <id> <t>", "p <text> post", "r <id> read",
-        ]
+        removable_order = ["dm <short> <t>","whois <short>","nodes","whoami","status","info","reply <id> <t>","p <text> post","r <id> read"]
         keep = parts[:]
         for item in removable_order:
             if item in keep:
                 keep.remove(item)
                 line = join_line(keep)
                 if len(line) <= MAX_TEXT: return line
-
         tiny = f"{header} r list | p | r <id> | ??"
         if len(tiny) <= MAX_TEXT: return tiny
-
         base = header if len(header) < MAX_TEXT - 12 else "[BBS]"
         return f"{base} r|p|r#|??"
 
     def _cmd_menu(self, frm):
-        """Show notice (if any) as its own message, then one-line menu."""
+        """Show notice (if any) first, then the one-line compact menu."""
         row = self.db.execute("SELECT v FROM kv WHERE k='notice'").fetchone()
-        if row and row["v"]:
-            self._send_text(frm, row["v"])
+        tsr = self.db.execute("SELECT v FROM kv WHERE k='notice_ts'").fetchone()
+        if row and (row["v"] or "").strip():
+            lines = [(row["v"] or "").strip()]
+            title = f"[Notice {nz_time_str(int(tsr['v']))}]" if tsr and tsr["v"] else "[Notice]"
+            self._send_paged(frm, lines, title=title)
         self._send_text(frm, self._menu_text())
 
     def _help_lines(self):
         return [
             f"[{BBS_NAME}] Help:",
-            "• r — list recent posts; r 12 — read post 12",
-            "• p hello world — post a new message",
-            "• reply 12 Thanks — reply to post 12",
-            "• info / info set <text> (admins) — notice board",
-            "• status — node long/short name and uptime",
-            "• whoami / whois <short> / nodes",
-            "• dm <short> <text> — queue a DM (delivered when seen)",
+            "• r — list recent; r 12 — read #12",
+            "• p hello — post new; reply 12 Thanks — reply",
+            "• info / info set <text> (admin)",
+            "• status — long/short/uptime; whoami",
+            "• nodes / whois <short>",
+            "• dm <short> <text> — queued DM",
             "• Admin: admins add|del <!id>, bl add|del <!id>",
             "• Peers: peer add|del <!id>, peer list, sync now|on|off",
-            "• health [full] — quick DB + link check",
+            "• health [full] — DB/link snapshot",
         ]
 
     def _cmd_help(self, frm): self._send_paged(frm, self._help_lines())
@@ -393,7 +379,6 @@ class MiniBBS:
         self._send_text(frm, f"no node with short '{short}'")
 
     def _cmd_nodes(self, frm):
-        """List nodes cleanly: ShortName, NodeID, LongName. Sorted by shortName, paged."""
         entries = []
         try:
             for key, entry in self._iter_nodes():
@@ -404,7 +389,6 @@ class MiniBBS:
                 entries.append((sn.lower(), f"{sn:>6}  {nid}  {ln}"))
         except Exception:
             entries = []
-
         entries.sort(key=lambda x: x[0])
         count = len(entries)
         lines = [s for _, s in entries] if count else ["(no nodes)"]
@@ -456,16 +440,24 @@ class MiniBBS:
 
     # ---------- Notice ----------
     def _cmd_info(self, frm, args, fromId):
-        if args and args[0] == "set":
+        if args and args[0].lower() == "set":
             if not self._is_admin(fromId):
                 self._send_text(frm, "admin only"); return
             body = " ".join(args[1:]).strip()
-            self.db.execute("INSERT INTO kv(k,v) VALUES('notice',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (body,))
+            self.db.execute("INSERT INTO kv(k,v) VALUES('notice',?) "
+                            "ON CONFLICT(k) DO UPDATE SET v=excluded.v", (body,))
+            self.db.execute("INSERT INTO kv(k,v) VALUES('notice_ts',?) "
+                            "ON CONFLICT(k) DO UPDATE SET v=excluded.v", (str(now()),))
             self.db.commit()
-            self._send_text(frm, "notice updated")
+            self._send_text(frm, f"notice updated @ {nz_time_str(now())}")
         else:
             row = self.db.execute("SELECT v FROM kv WHERE k='notice'").fetchone()
-            self._send_text(frm, row["v"] if row and row["v"] else "No notice set.")
+            tsr = self.db.execute("SELECT v FROM kv WHERE k='notice_ts'").fetchone()
+            if row and (row["v"] or "").strip():
+                when = nz_time_str(int(tsr["v"])) if tsr and tsr["v"] else "unknown"
+                self._send_paged(frm, [(row["v"] or "").strip()], title=f"[Notice {when}]")
+            else:
+                self._send_text(frm, "No notice set.")
 
     # ---------- DM store-&-forward ----------
     def _cmd_dm(self, frm, short, *text):
@@ -492,7 +484,6 @@ class MiniBBS:
 
     # ---------- Admin / blacklist ----------
     def _is_admin(self, fromId): return bool(self.db.execute("SELECT 1 FROM admins WHERE id=?", (fromId,)).fetchone())
-
     def _admin_add(self, nid):
         try:
             self.db.execute("INSERT OR IGNORE INTO admins(id) VALUES(?)", (nid,)); self.db.commit()
@@ -533,7 +524,7 @@ class MiniBBS:
             f"admins={admins} bl={bl} qdm={qdm} nodes={nodes}",
             f"sync={sync} last_inv={inv_ago}",
         ]
-        self._send_paged(frm, lines, title=f"[{BBS_NAME}] Health:")
+        self._send_paged(frm, lines, title=f"[{BBS_NAME}] Health:]")
 
     # ---------- Peer sync ----------
     def _sync_loop(self):
@@ -644,7 +635,7 @@ class MiniBBS:
             self.db.commit()
             return
 
-    # ---------- Text extraction ----------
+    # ---------- Receive ----------
     def _extract_text(self, packet) -> Optional[str]:
         d = packet.get("decoded", {}) or {}
         txt = d.get("text")
@@ -659,38 +650,39 @@ class MiniBBS:
         if isinstance(pay, str): return pay
         return None
 
-    # ---------- Receive path ----------
     def _on_receive(self, packet, interface):
         try:
-            fromId = packet.get("fromId")
-            if not fromId:
-                src = packet.get("from")
-                if isinstance(src, int):
-                    fromId = f"!{src & 0xffffffff:08x}"
+            fromId = self._canon_nodeid(packet.get("fromId"), packet)
             txt = self._extract_text(packet)
             if not fromId or txt is None:
                 return
             self.last_rx_at = time.time()
 
-            low = txt.strip()
-            dlog(f"[recv] {fromId} ch=0: {low}")
+            low_raw = txt.strip()
+            norm = " ".join(low_raw.split()).lower()
+            dlog(f"[recv] {fromId} ch=0: {low_raw}")
 
             # deliver queued DMs if this node appeared
             self._deliver_queued(fromId)
 
             # peer sync first
-            if low.startswith(SYNC_TAG):
-                self._handle_sync(fromId, low); return
+            if norm.startswith(SYNC_TAG.lower()):
+                self._handle_sync(fromId, low_raw); return
 
             # blacklisted?
             if self.db.execute("SELECT 1 FROM blacklist WHERE id=?", (fromId,)).fetchone():
                 dlog(f"[drop] blacklisted {fromId}")
                 return
 
-            # menu/help bypass rate limit
-            if low in ("?","??","menu","help"):
-                (self._cmd_menu if low in ("?","menu") else self._cmd_help)(fromId)
-                return
+            # --- BYPASS rate-limit: menu/help/info (case/whitespace tolerant) ---
+            if norm in ("?", "menu"):
+                self._cmd_menu(fromId); return
+            if norm in ("??", "help"):
+                self._cmd_help(fromId); return
+            if norm == "info" or norm.startswith("info "):
+                args = low_raw.split()[1:] if len(low_raw.split()) > 1 else []
+                self._cmd_info(fromId, args, fromId); return
+            # --------------------------------------------------------------------
 
             # rate limit for everything else
             tprev = self.last_seen.get(fromId, 0.0)
@@ -699,8 +691,7 @@ class MiniBBS:
                 return
             self.last_seen[fromId] = time.time()
 
-            # parse commands
-            tok = low.split()
+            tok = low_raw.split()
             if not tok: return
             cmd = tok[0].lower()
 
@@ -708,12 +699,12 @@ class MiniBBS:
                 self._cmd_read(fromId, tok[1] if len(tok) > 1 else None); return
             if cmd in ("p","post"):
                 if len(tok) >= 2:
-                    self._cmd_post(fromId, fromId, low[len(tok[0]):].strip())
+                    self._cmd_post(fromId, fromId, low_raw[len(tok[0]):].strip())
                 else:
                     self._send_text(fromId, "usage: p <text>")
                 return
             if cmd == "reply" and len(tok) >= 3:
-                self._cmd_reply(fromId, fromId, tok[1], low.split(None,2)[2]); return
+                self._cmd_reply(fromId, fromId, tok[1], low_raw.split(None,2)[2]); return
             if cmd == "info":
                 self._cmd_info(fromId, tok[1:], fromId); return
             if cmd == "status": self._cmd_status(fromId); return
@@ -796,3 +787,5 @@ if __name__ == "__main__":
 PY
 sudo chown pihole:pihole /opt/meshmini/meshmini.py
 sudo chmod +x /opt/meshmini/meshmini.py
+sudo systemctl restart meshmini
+sudo journalctl -u meshmini -n 40 --no-pager
