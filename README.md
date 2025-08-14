@@ -22,7 +22,7 @@
 sudo apt-get update && sudo apt-get install -y python3-venv
 
 # 2) Put files on the Pi and install:
-#    (from the repo root that contains meshmini.py and install_meshmini.sh)
+#    (from the repo root that contains meshmini.py and install.sh)
 sudo bash install_meshmini.sh --user $USER --device auto --name "MeshLink BBS"
 # Optional at install:
 #   --admins "!cafef00d,!deadbeef"
