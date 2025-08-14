@@ -1,12 +1,15 @@
+sudo tee /opt/meshmini/meshmini.py >/dev/null <<'PY'
 #!/usr/bin/env python3
-# MeshMini — minimal Meshtastic BBS with peer sync (v0.8.3)
-# - Compact one-block '?' menu (notice shown first, in its own message)
+# MeshMini — minimal Meshtastic BBS with peer sync (v0.8.6)
+# - Compact one-line '?' menu (auto-shrinks to fit MAX_TEXT)
+# - Notice (if set) sent first, as its own message
 # - Robust text decoding (bytes/str)
 # - PubSub backup for receive path (if pypubsub available)
 # - RX watchdog: auto-reconnect if no packets for a while
-# - Store-&-forward DMs
+# - Store-&-forward DMs (by shortName)
 # - Simple peer sync (inventory + chunked post replication)
 # - SQLite persistence; admin + blacklist; health
+# - FIX: 'nodes' tolerates string/int keys & empty primary map; falls back gracefully
 
 import os, sys, time, sqlite3, threading, random, string
 from datetime import datetime
@@ -187,12 +190,88 @@ class MiniBBS:
         try:
             num = self._nodeid_to_num(nodeid)
             if num is None: return ("","")
-            n = self.iface.nodes.get(num) if self.iface else None
+            n = self.iface.nodes.get(num) if getattr(self.iface, "nodes", None) else None
             if not n: return ("","")
             u = n.get("user",{}) if isinstance(n, dict) else {}
             return (u.get("shortName",""), u.get("longName",""))
         except Exception:
             return ("","")
+
+    def _key_to_nodeid(self, key, entry) -> str:
+        """
+        Convert various node key formats (int, hex str, '!hex', dict fields)
+        into a canonical '!xxxxxxxx' lowercased string.
+        """
+        # Case 1: integer key
+        if isinstance(key, int):
+            return f"!{key & 0xffffffff:08x}"
+
+        # Case 2: string key
+        if isinstance(key, str):
+            s = key.strip()
+            if s.startswith("!"):
+                return s.lower()
+            # try hex
+            try:
+                return f"!{int(s, 16) & 0xffffffff:08x}"
+            except Exception:
+                pass
+
+        # Case 3: look inside the entry for common fields
+        if isinstance(entry, dict):
+            for fld in ("num", "nodeNum", "node_id", "nodeId", "id"):
+                v = entry.get(fld)
+                if isinstance(v, int):
+                    return f"!{v & 0xffffffff:08x}"
+                if isinstance(v, str):
+                    sv = v.strip()
+                    if sv.startswith("!"):
+                        return sv.lower()
+                    try:
+                        return f"!{int(sv, 16) & 0xffffffff:08x}"
+                    except Exception:
+                        pass
+
+        # Fallback
+        return "!?unknown"
+
+    def _iter_nodes(self):
+        """
+        Yield (key, entry) pairs from whatever node map the library exposes.
+        Tries several known attributes; if all empty, yields just 'self' node if available.
+        """
+        # 1) Primary map
+        nd = getattr(self.iface, "nodes", None)
+        if isinstance(nd, dict) and nd:
+            for k, v in nd.items():
+                yield (k, v)
+            return
+
+        # 2) Alternate internal maps some versions keep
+        for attr in ("nodesByNum", "_nodesByNum", "_nodes"):
+            alt = getattr(self.iface, attr, None)
+            if isinstance(alt, dict) and alt:
+                for k, v in alt.items():
+                    yield (k, v)
+                return
+
+        # 3) As a last resort, expose our own node so 'nodes' isn't empty
+        try:
+            info = self.iface.getMyNodeInfo()
+            mynum = (info.get("my_node_num")
+                     or info.get("num")
+                     or info.get("nodeNum"))
+            entry = {
+                "user": {
+                    "shortName": info.get("shortName","") or (info.get("owner") or ""),
+                    "longName":  info.get("longName","")  or (info.get("owner") or ""),
+                },
+                "num": mynum
+            }
+            if mynum is not None:
+                yield (mynum, entry)
+        except Exception:
+            return
 
     # ---------- Messaging ----------
     def _send_text(self, dest: Optional[str], text: str):
@@ -226,30 +305,48 @@ class MiniBBS:
 
     # ---------- UI ----------
     def _menu_text(self) -> str:
-        """Return a compact one-block menu that fits in MAX_TEXT."""
-        lines = [
-            f"[{BBS_NAME}]",
-            "r list | r <id> read",
-            "p <text> post | reply <id> <t>",
-            "info | status | whoami | nodes",
-            "whois <short> | dm <short> <t>",
-            "?? help",
+        """
+        Return a single-line compact menu, guaranteed to fit in MAX_TEXT.
+        If needed, it progressively removes less-critical items to stay under budget.
+        """
+        # Header (trim name if it's absurdly long)
+        name = BBS_NAME.strip()
+        if len(name) > 28:
+            words = name.split()
+            if len(words) > 1:
+                name = f"{words[0]} {' '.join(w[0] for w in words[1:])}"
+            name = name[:28].rstrip()
+        header = f"[{name}]"
+
+        parts = [
+            "r list", "r <id> read", "p <text> post", "reply <id> <t>",
+            "info", "status", "whoami", "nodes", "whois <short>", "dm <short> <t>", "?? help",
         ]
-        text = "\n".join(lines)
-        if len(text) <= MAX_TEXT:
-            return text
-        tight = "\n".join([
-            f"[{BBS_NAME}]",
-            "r|r <id>|p|reply",
-            "info|status|whoami|nodes",
-            "whois|dm|??",
-        ])
-        if len(tight) <= MAX_TEXT:
-            return tight
-        return f"[{BBS_NAME}] r|p|info|status|??"
+
+        def join_line(items): return f"{header} " + " | ".join(items)
+
+        line = join_line(parts)
+        if len(line) <= MAX_TEXT: return line
+
+        removable_order = [
+            "dm <short> <t>", "whois <short>", "nodes", "whoami",
+            "status", "info", "reply <id> <t>", "p <text> post", "r <id> read",
+        ]
+        keep = parts[:]
+        for item in removable_order:
+            if item in keep:
+                keep.remove(item)
+                line = join_line(keep)
+                if len(line) <= MAX_TEXT: return line
+
+        tiny = f"{header} r list | p | r <id> | ??"
+        if len(tiny) <= MAX_TEXT: return tiny
+
+        base = header if len(header) < MAX_TEXT - 12 else "[BBS]"
+        return f"{base} r|p|r#|??"
 
     def _cmd_menu(self, frm):
-        """Show notice (if any) as its own message, then one-block menu."""
+        """Show notice (if any) as its own message, then one-line menu."""
         row = self.db.execute("SELECT v FROM kv WHERE k='notice'").fetchone()
         if row and row["v"]:
             self._send_text(frm, row["v"])
@@ -286,23 +383,32 @@ class MiniBBS:
         self._send_text(frm, f"{fromId} / {sn} / {ln}")
 
     def _cmd_whois(self, frm, short):
-        for num, n in (self.iface.nodes or {}).items():
-            u = n.get("user","")
+        for key, entry in self._iter_nodes():
+            u = entry.get("user","") if isinstance(entry, dict) else {}
             if isinstance(u, dict) and u.get("shortName","").lower() == short.lower():
-                nid = f"!{num & 0xffffffff:08x}"
+                nid = self._key_to_nodeid(key, entry)
                 ln  = u.get("longName",""); sn = u.get("shortName","")
                 self._send_text(frm, f"{nid} / {sn} / {ln}")
                 return
         self._send_text(frm, f"no node with short '{short}'")
 
     def _cmd_nodes(self, frm):
-        lines = []
-        for num, n in (self.iface.nodes or {}).items():
-            u = n.get("user",{})
-            nid = f"!{num & 0xffffffff:08x}"
-            lines.append(f"{u.get('shortName','?'):>6}  {nid}")
-        lines.sort()
-        self._send_paged(frm, lines or ["(none)"], title=f"[{BBS_NAME}] Nodes:")
+        """List nodes cleanly: ShortName, NodeID, LongName. Sorted by shortName, paged."""
+        entries = []
+        try:
+            for key, entry in self._iter_nodes():
+                u = entry.get("user", {}) if isinstance(entry, dict) else {}
+                sn = (u.get("shortName") or "?").strip() or "?"
+                ln = (u.get("longName") or "").strip()
+                nid = self._key_to_nodeid(key, entry)
+                entries.append((sn.lower(), f"{sn:>6}  {nid}  {ln}"))
+        except Exception:
+            entries = []
+
+        entries.sort(key=lambda x: x[0])
+        count = len(entries)
+        lines = [s for _, s in entries] if count else ["(no nodes)"]
+        self._send_paged(frm, lines, title=f"[{BBS_NAME}] Nodes: {count}")
 
     # ---------- Posts ----------
     def _post_new(self, author, text, reply_to=None, do_sync=True):
@@ -367,10 +473,10 @@ class MiniBBS:
         if not msg:
             self._send_text(frm, "dm usage: dm <short> <text>"); return
         target = None
-        for num, n in (self.iface.nodes or {}).items():
-            u = n.get("user",{})
-            if u.get("shortName","").lower() == short.lower():
-                target = f"!{num & 0xffffffff:08x}"; break
+        for key, entry in self._iter_nodes():
+            u = entry.get("user",{})
+            if isinstance(u, dict) and u.get("shortName","").lower() == short.lower():
+                target = self._key_to_nodeid(key, entry); break
         if not target:
             self._send_text(frm, f"no node with short '{short}'"); return
         self.db.execute("INSERT INTO dm_out(to_id,body,created_ts,delivered_ts) VALUES(?,?,?,NULL)", (target, msg, now()))
@@ -406,7 +512,7 @@ class MiniBBS:
             self._send_text(frm, "admin only"); return
         dev = self.dev_path or "n/a"
         up = fmt_uptime(now() - self.connected_at)
-        try: nodes = len(self.iface.nodes)
+        try: nodes = sum(1 for _ in self._iter_nodes())
         except Exception: nodes = 0
         cur = self.db.cursor()
         posts = cur.execute("SELECT COUNT(*) c FROM posts").fetchone()["c"]
@@ -613,7 +719,7 @@ class MiniBBS:
             if cmd == "status": self._cmd_status(fromId); return
             if cmd == "whoami": self._cmd_whoami(fromId, fromId); return
             if cmd == "whois" and len(tok)>=2: self._cmd_whois(fromId, tok[1]); return
-            if cmd == "nodes": self._cmd_nodes(fromId); return
+            if cmd in ("nodes","node"): self._cmd_nodes(fromId); return
             if cmd == "dm" and len(tok)>=3: self._cmd_dm(fromId, tok[1], *tok[2:]); return
             if cmd == "health": self._cmd_health(fromId, tok[1:], fromId); return
 
@@ -687,3 +793,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+PY
+sudo chown pihole:pihole /opt/meshmini/meshmini.py
+sudo chmod +x /opt/meshmini/meshmini.py
