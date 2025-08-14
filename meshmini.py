@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
-# MeshMini — minimal Meshtastic BBS with peer sync (v0.8 - health)
-# Focus: simplicity, reliability, and small RF footprint.
+# MeshMini — minimal Meshtastic BBS with peer sync (v0.8.3)
+# - Compact one-block '?' menu (notice shown first, in its own message)
+# - Robust text decoding (bytes/str)
+# - PubSub backup for receive path (if pypubsub available)
+# - RX watchdog: auto-reconnect if no packets for a while
+# - Store-&-forward DMs
+# - Simple peer sync (inventory + chunked post replication)
+# - SQLite persistence; admin + blacklist; health
 
-import os, sys, time, json, sqlite3, threading, random, string
+import os, sys, time, sqlite3, threading, random, string
 from datetime import datetime
 from typing import List, Optional
+from collections import deque
 
 # --- Meshtastic imports ---
 try:
@@ -12,39 +19,51 @@ try:
     import meshtastic.serial_interface
     from meshtastic.mesh_interface import MeshInterface
 except Exception:
-    sys.stderr.write("[meshmini] Missing deps. In venv: pip install meshtastic pypubsub\n")
+    sys.stderr.write("[meshmini] Missing deps. In venv run: pip install meshtastic pypubsub\n")
     sys.exit(1)
 
-DB_PATH      = os.environ.get("MMB_DB", "/opt/meshmini/board.db")
-DEVICE_PATH  = os.environ.get("MMB_DEVICE", "auto")
-BBS_NAME     = os.environ.get("MMB_NAME", "MeshLink BBS")
-ADMINS_CSV   = os.environ.get("MMB_ADMINS", "")
-RATE_SEC     = float(os.environ.get("MMB_RATE", "2"))             # rate limit per sender
-CH_FALLBACK  = int(os.environ.get("MMB_CH_FALLBACK", "0"))
-REPLY_BCAST  = int(os.environ.get("MMB_REPLY_BCAST", "0"))
-DIRECT_FB    = int(os.environ.get("MMB_DIRECT_FALLBACK", "0"))
-FB_WAIT      = float(os.environ.get("MMB_FALLBACK_SEC", "5"))
-MAX_TEXT     = int(os.environ.get("MMB_MAX_TEXT", "140"))
-TX_GAP       = float(os.environ.get("MMB_TX_GAP", "1.0"))
-HEALTH_PUBLIC= int(os.environ.get("MMB_HEALTH_PUBLIC", "0"))      # 1 => health visible to all
+# Optional: pubsub backup
+try:
+    from pubsub import pub  # type: ignore
+except Exception:
+    pub = None  # still works without it
 
-# --- Peer sync knobs ---
-SYNC_ON      = int(os.environ.get("MMB_SYNC", "1"))               # enable/disable sync
+# --- Environment / knobs ---
+DB_PATH       = os.environ.get("MMB_DB", "/opt/meshmini/board.db")
+DEVICE_PATH   = os.environ.get("MMB_DEVICE", "auto")
+BBS_NAME      = os.environ.get("MMB_NAME", "MeshLink BBS")
+ADMINS_CSV    = os.environ.get("MMB_ADMINS", "")
+RATE_SEC      = float(os.environ.get("MMB_RATE", "2"))             # per-sender rate limit
+CH_FALLBACK   = int(os.environ.get("MMB_CH_FALLBACK", "0"))        # reserved for future
+REPLY_BCAST   = int(os.environ.get("MMB_REPLY_BCAST", "0"))        # reserved for future
+DIRECT_FB     = int(os.environ.get("MMB_DIRECT_FALLBACK", "0"))    # reserved for future
+FB_WAIT       = float(os.environ.get("MMB_FALLBACK_SEC", "5"))
+MAX_TEXT      = int(os.environ.get("MMB_MAX_TEXT", "140"))
+TX_GAP        = float(os.environ.get("MMB_TX_GAP", "1.0"))
+HEALTH_PUBLIC = int(os.environ.get("MMB_HEALTH_PUBLIC", "0"))      # 1 => health visible to all
+DEBUG_LOG     = int(os.environ.get("MMB_DEBUG", "0"))              # 1 => verbose logs
+
+# Peer sync knobs
+SYNC_ON      = int(os.environ.get("MMB_SYNC", "1"))
 PEERS_ENV    = [p.strip() for p in os.environ.get("MMB_PEERS", "").split(",") if p.strip()]
-SYNC_INV_N   = max(5, int(os.environ.get("MMB_SYNC_INV", "15")))  # advertised IDs per inventory
-SYNC_PERIOD  = int(os.environ.get("MMB_SYNC_PERIOD", "300"))      # seconds between gossip
-CHUNK_BYTES  = int(os.environ.get("MMB_SYNC_CHUNK", "160"))       # payload per PART
-SYNC_TAG     = "#SYNC"                                            # control messages start with this
+SYNC_INV_N   = max(5, int(os.environ.get("MMB_SYNC_INV", "15")))
+SYNC_PERIOD  = int(os.environ.get("MMB_SYNC_PERIOD", "300"))
+CHUNK_BYTES  = int(os.environ.get("MMB_SYNC_CHUNK", "160"))
+SYNC_TAG     = "#SYNC"
+
+# Watchdog knobs
+RX_STALE_SEC = int(os.environ.get("MMB_RX_STALE_SEC", "240"))      # reconnect if no RX for N seconds
+WATCH_TICK   = int(os.environ.get("MMB_WATCH_TICK", "10"))
 
 def now() -> int: return int(time.time())
-
-def gen_uid(n=10):
-    return ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(n))
-
+def gen_uid(n=10): return ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(n))
 def fmt_uptime(seconds:int) -> str:
-    h = seconds // 3600
-    m = (seconds % 3600) // 60
+    h = seconds // 3600; m = (seconds % 3600) // 60
     return f"{h}h{m:02d}m"
+
+def dlog(msg: str):
+    if DEBUG_LOG:
+        print(msg, flush=True)
 
 class MiniBBS:
     def __init__(self, device="auto"):
@@ -53,11 +72,14 @@ class MiniBBS:
         self.node_id = None
         self.dev_path = None
         self.connected_at = 0
-        self.last_seen = {}  # rate limit per sender
+        self.last_rx_at = 0.0
+        self.last_seen = {}  # per-sender rate limiter
         self.stop_evt = threading.Event()
         self.sync_enabled = bool(SYNC_ON)
         self.sync_thread = None
+        self.watch_thread = None
         self.last_inv_at = 0
+        self.seen_pkt_ids = deque(maxlen=256)
 
         self.db = sqlite3.connect(DB_PATH, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
@@ -80,15 +102,12 @@ class MiniBBS:
         cur.execute("CREATE TABLE IF NOT EXISTS seen_uids (uid TEXT PRIMARY KEY, ts INTEGER)")
         cur.execute("CREATE TABLE IF NOT EXISTS applied_uids (uid TEXT PRIMARY KEY, ts INTEGER)")
         cur.execute("CREATE TABLE IF NOT EXISTS rxparts (uid TEXT PRIMARY KEY, total INTEGER, got INTEGER, data TEXT, from_id TEXT, created_ts INTEGER)")
-        # DM outbox
         cur.execute("CREATE TABLE IF NOT EXISTS dm_out (id INTEGER PRIMARY KEY, to_id TEXT, body TEXT, created_ts INTEGER, delivered_ts INTEGER)")
         self.db.commit()
 
     # ---------- Serial connect ----------
     def _candidate_ports(self) -> List[str]:
-        if self.device != "auto":
-            return [self.device]
-        # common ACM/USB and by-id paths
+        if self.device != "auto": return [self.device]
         cands = []
         for d in ("/dev/ttyACM0","/dev/ttyACM1","/dev/ttyUSB0","/dev/ttyUSB1"):
             if os.path.exists(d): cands.append(d)
@@ -108,31 +127,89 @@ class MiniBBS:
                 self.node_id = self.iface.myInfo.my_node_num if hasattr(self.iface, "myInfo") else None
                 self.dev_path = cand
                 self.connected_at = now()
-                # register callback
-                self.iface.onReceive = self._on_receive
+                self.last_rx_at = time.time()
+                self.iface.onReceive = self._on_receive  # primary callback
                 print(f"[meshmini] Connected on {cand}.")
+                self._subscribe_pub()  # backup path
                 return
             except Exception as e:
                 last_err = e
                 time.sleep(1.0)
         raise last_err or RuntimeError("No serial candidates found")
 
-    # ---------- Messaging helpers ----------
+    def _reconnect(self):
+        try:
+            print("[meshmini] Reconnecting serial…")
+            if self.iface:
+                try: self.iface.close()
+                except: pass
+            self.iface = None
+            time.sleep(1.0)
+            self._connect()
+        except Exception as e:
+            print(f"[meshmini] reconnect failed: {e}")
+
+    # ---------- PubSub backup ----------
+    def _subscribe_pub(self):
+        if not pub:
+            dlog("[meshmini] PubSub not available; relying on onReceive only")
+            return
+        # Unsubscribe (in case of reconnect)
+        for topic in ("meshtastic.receive", "meshtastic.receive.text"):
+            try: pub.unsubscribe(self._on_pub_receive, topic)
+            except Exception: pass
+        # Subscribe
+        try:
+            pub.subscribe(self._on_pub_receive, "meshtastic.receive")
+            pub.subscribe(self._on_pub_receive, "meshtastic.receive.text")
+            dlog("[meshmini] PubSub backup subscribed")
+        except Exception as e:
+            dlog(f"[meshmini] PubSub subscribe failed: {e}")
+
+    def _on_pub_receive(self, packet=None, interface=None, **kwargs):
+        if not packet: return
+        pid = packet.get("id") or (packet.get("from"), packet.get("rxTime"))
+        if pid in self.seen_pkt_ids:  # dedupe vs onReceive
+            return
+        self.seen_pkt_ids.append(pid)
+        self._on_receive(packet, interface)
+
+    # ---------- Helpers ----------
+    def _nodeid_to_num(self, nid: str) -> Optional[int]:
+        try:
+            if nid and nid.startswith("!"):
+                return int(nid[1:], 16)
+        except Exception:
+            pass
+        return None
+
+    def _lookup_names(self, nodeid: str) -> tuple[str,str]:
+        try:
+            num = self._nodeid_to_num(nodeid)
+            if num is None: return ("","")
+            n = self.iface.nodes.get(num) if self.iface else None
+            if not n: return ("","")
+            u = n.get("user",{}) if isinstance(n, dict) else {}
+            return (u.get("shortName",""), u.get("longName",""))
+        except Exception:
+            return ("","")
+
+    # ---------- Messaging ----------
     def _send_text(self, dest: Optional[str], text: str):
-        """dest: '!nodeid' for direct, or None for broadcast on primary channel."""
         if not self.iface: return
         text = text.strip()
         try:
             if dest and dest.startswith("!"):
+                dlog(f"[send] -> {dest} ch=0: {text}")
                 self.iface.sendText(text, destinationId=dest)
             else:
+                dlog(f"[send] -> ^all ch=0: {text}")
                 self.iface.sendText(text)
             time.sleep(TX_GAP)
         except Exception as e:
             print(f"[meshmini] send error: {e}")
 
     def _send_paged(self, dest: Optional[str], lines: List[str], title=None):
-        """Split into pages to stay within size limits."""
         head = f"{title}\n" if title else ""
         pages, cur = [], head
         for ln in lines:
@@ -148,22 +225,35 @@ class MiniBBS:
             self._send_text(dest, prefix + p)
 
     # ---------- UI ----------
-    def _menu_lines(self):
-        return [
-            f"[{BBS_NAME}] Menu:",
-            "r                Read messages",
-            "r <id>           Read message <id>",
-            "p <text>         Post message",
-            "reply <id> <t>   Reply to a message",
-            "info             Show notice (if set)",
-            "status           Node name/uptime",
-            "whoami           Your ID and names",
-            "whois <short>    Lookup node by short name",
-            "nodes            List nearby nodes",
-            "dm <short> <t>   Store-&-forward DM",
-            "health [full]    Quick system health",
-            "??               Help (detailed)",
+    def _menu_text(self) -> str:
+        """Return a compact one-block menu that fits in MAX_TEXT."""
+        lines = [
+            f"[{BBS_NAME}]",
+            "r list | r <id> read",
+            "p <text> post | reply <id> <t>",
+            "info | status | whoami | nodes",
+            "whois <short> | dm <short> <t>",
+            "?? help",
         ]
+        text = "\n".join(lines)
+        if len(text) <= MAX_TEXT:
+            return text
+        tight = "\n".join([
+            f"[{BBS_NAME}]",
+            "r|r <id>|p|reply",
+            "info|status|whoami|nodes",
+            "whois|dm|??",
+        ])
+        if len(tight) <= MAX_TEXT:
+            return tight
+        return f"[{BBS_NAME}] r|p|info|status|??"
+
+    def _cmd_menu(self, frm):
+        """Show notice (if any) as its own message, then one-block menu."""
+        row = self.db.execute("SELECT v FROM kv WHERE k='notice'").fetchone()
+        if row and row["v"]:
+            self._send_text(frm, row["v"])
+        self._send_text(frm, self._menu_text())
 
     def _help_lines(self):
         return [
@@ -180,14 +270,6 @@ class MiniBBS:
             "• health [full] — quick DB + link check",
         ]
 
-    # ---------- Commands ----------
-    def _cmd_menu(self, frm):
-        # optional notice as page 1
-        row = self.db.execute("SELECT v FROM kv WHERE k='notice'").fetchone()
-        if row and row["v"]:
-            self._send_paged(frm, [row["v"]], title=None)  # notice only page 1
-        self._send_paged(frm, self._menu_lines())
-
     def _cmd_help(self, frm): self._send_paged(frm, self._help_lines())
 
     def _cmd_status(self, frm):
@@ -200,18 +282,14 @@ class MiniBBS:
         self._send_text(frm, f"{ln} / {sn} / up {up}")
 
     def _cmd_whoami(self, frm, fromId):
-        ln = ""; sn = ""
-        try:
-            n = self.iface.getNode(fromId)
-            if n: ln = n.get("longName",""); sn = n.get("shortName","")
-        except Exception: pass
+        sn, ln = self._lookup_names(fromId)
         self._send_text(frm, f"{fromId} / {sn} / {ln}")
 
     def _cmd_whois(self, frm, short):
-        for n in self.iface.nodes.values():
+        for num, n in (self.iface.nodes or {}).items():
             u = n.get("user","")
             if isinstance(u, dict) and u.get("shortName","").lower() == short.lower():
-                nid = f"!{n['num'] & 0xffffffff:08x}"
+                nid = f"!{num & 0xffffffff:08x}"
                 ln  = u.get("longName",""); sn = u.get("shortName","")
                 self._send_text(frm, f"{nid} / {sn} / {ln}")
                 return
@@ -219,13 +297,14 @@ class MiniBBS:
 
     def _cmd_nodes(self, frm):
         lines = []
-        for num, n in self.iface.nodes.items():
+        for num, n in (self.iface.nodes or {}).items():
             u = n.get("user",{})
             nid = f"!{num & 0xffffffff:08x}"
             lines.append(f"{u.get('shortName','?'):>6}  {nid}")
         lines.sort()
-        self._send_paged(frm, lines, title=f"[{BBS_NAME}] Nodes:")
+        self._send_paged(frm, lines or ["(none)"], title=f"[{BBS_NAME}] Nodes:")
 
+    # ---------- Posts ----------
     def _post_new(self, author, text, reply_to=None, do_sync=True):
         cur = self.db.cursor()
         cur.execute("INSERT INTO posts(ts,author,body,reply_to) VALUES(?,?,?,?)", (now(), author, text, reply_to))
@@ -267,9 +346,9 @@ class MiniBBS:
             for r in cur.execute("SELECT id,ts,author,body FROM posts ORDER BY id DESC LIMIT 10"):
                 ts = datetime.utcfromtimestamp(r["ts"]).strftime("%m-%d %H:%M")
                 lines.append(f"#{r['id']:>4} {ts} {r['author']}: {r['body']}")
-            if not lines: lines = ["(no posts yet)"]
-            self._send_paged(frm, lines, title=f"[{BBS_NAME}] Recent:")
+            self._send_paged(frm, lines or ["(no posts yet)"], title=f"[{BBS_NAME}] Recent:")
 
+    # ---------- Notice ----------
     def _cmd_info(self, frm, args, fromId):
         if args and args[0] == "set":
             if not self._is_admin(fromId):
@@ -282,19 +361,18 @@ class MiniBBS:
             row = self.db.execute("SELECT v FROM kv WHERE k='notice'").fetchone()
             self._send_text(frm, row["v"] if row and row["v"] else "No notice set.")
 
+    # ---------- DM store-&-forward ----------
     def _cmd_dm(self, frm, short, *text):
         msg = " ".join(text).strip()
         if not msg:
             self._send_text(frm, "dm usage: dm <short> <text>"); return
-        # resolve short
         target = None
-        for num, n in self.iface.nodes.items():
+        for num, n in (self.iface.nodes or {}).items():
             u = n.get("user",{})
             if u.get("shortName","").lower() == short.lower():
                 target = f"!{num & 0xffffffff:08x}"; break
         if not target:
             self._send_text(frm, f"no node with short '{short}'"); return
-        # queue
         self.db.execute("INSERT INTO dm_out(to_id,body,created_ts,delivered_ts) VALUES(?,?,?,NULL)", (target, msg, now()))
         self.db.commit()
         self._send_text(frm, f"queued dm to {short} ({target})")
@@ -306,8 +384,8 @@ class MiniBBS:
             cur.execute("UPDATE dm_out SET delivered_ts=? WHERE id=?", (now(), row["id"]))
         self.db.commit()
 
-    def _is_admin(self, fromId):
-        return bool(self.db.execute("SELECT 1 FROM admins WHERE id=?", (fromId,)).fetchone())
+    # ---------- Admin / blacklist ----------
+    def _is_admin(self, fromId): return bool(self.db.execute("SELECT 1 FROM admins WHERE id=?", (fromId,)).fetchone())
 
     def _admin_add(self, nid):
         try:
@@ -326,15 +404,10 @@ class MiniBBS:
     def _cmd_health(self, frm, args, fromId):
         if not HEALTH_PUBLIC and not self._is_admin(fromId):
             self._send_text(frm, "admin only"); return
-
-        # radio basics
         dev = self.dev_path or "n/a"
         up = fmt_uptime(now() - self.connected_at)
-        nodes = 0
         try: nodes = len(self.iface.nodes)
-        except Exception: pass
-
-        # db stats
+        except Exception: nodes = 0
         cur = self.db.cursor()
         posts = cur.execute("SELECT COUNT(*) c FROM posts").fetchone()["c"]
         latest = cur.execute("SELECT IFNULL(MAX(id),0) m FROM posts").fetchone()["m"]
@@ -342,18 +415,12 @@ class MiniBBS:
         peers  = cur.execute("SELECT COUNT(*) c FROM peers").fetchone()["c"]
         bl     = cur.execute("SELECT COUNT(*) c FROM blacklist").fetchone()["c"]
         qdm    = cur.execute("SELECT COUNT(*) c FROM dm_out WHERE delivered_ts IS NULL").fetchone()["c"]
-        rxin   = cur.execute("SELECT COUNT(*) c FROM rxparts WHERE got < total").fetchone()["c"]
-
-        inv = self.last_inv_at
+        inv    = self.last_inv_at
         inv_ago = f"{(now()-inv)}s ago" if inv else "n/a"
-        sync = "on" if self.sync_enabled else "off"
-
+        sync   = "on" if self.sync_enabled else "off"
         line = f"link=ok dev={dev} up={up} posts={posts} latest={latest} peers={peers} admins={admins} bl={bl} qdm={qdm} nodes={nodes} sync={sync} inv={inv_ago}"
         if len(line) <= MAX_TEXT:
-            self._send_text(frm, line)
-            return
-
-        # fall back to multi-line (full or if too long)
+            self._send_text(frm, line); return
         lines = [
             f"link=ok dev={dev} up={up}",
             f"posts={posts} latest={latest} peers={peers}",
@@ -362,15 +429,14 @@ class MiniBBS:
         ]
         self._send_paged(frm, lines, title=f"[{BBS_NAME}] Health:")
 
-    # ---------- Peer sync protocol ----------
+    # ---------- Peer sync ----------
     def _sync_loop(self):
         while not self.stop_evt.wait(SYNC_PERIOD):
             if self.sync_enabled:
                 self._broadcast_inventory()
 
     def _broadcast_inventory(self):
-        ids = [str(r["id"]) for r in self.db.execute(
-            "SELECT id FROM posts ORDER BY id DESC LIMIT ?", (SYNC_INV_N,))]
+        ids = [str(r["id"]) for r in self.db.execute("SELECT id FROM posts ORDER BY id DESC LIMIT ?", (SYNC_INV_N,))]
         if not ids: return
         payload = f"{SYNC_TAG} INV ids=" + ",".join(ids[::-1])  # ascending
         for peer in self._peer_list():
@@ -472,114 +538,139 @@ class MiniBBS:
             self.db.commit()
             return
 
-    # ---------- Receive ----------
-    def _on_receive(self, packet, interface):  # meshtastic callback
-        d = packet.get("decoded", {})
-        txt = d.get("text") or d.get("payload")
-        if not isinstance(txt, str):  # sometimes bytes
-            try: txt = txt.decode("utf-8","ignore")
-            except: return
-        fromId = packet.get("fromId")
-        if not fromId: return
+    # ---------- Text extraction ----------
+    def _extract_text(self, packet) -> Optional[str]:
+        d = packet.get("decoded", {}) or {}
+        txt = d.get("text")
+        if isinstance(txt, bytes):
+            try: return txt.decode("utf-8","ignore")
+            except: pass
+        if isinstance(txt, str): return txt
+        pay = d.get("payload")
+        if isinstance(pay, bytes):
+            try: return pay.decode("utf-8","ignore")
+            except: return None
+        if isinstance(pay, str): return pay
+        return None
 
-        # Deliver queued DMs if we see this node
-        self._deliver_queued(fromId)
+    # ---------- Receive path ----------
+    def _on_receive(self, packet, interface):
+        try:
+            fromId = packet.get("fromId")
+            if not fromId:
+                src = packet.get("from")
+                if isinstance(src, int):
+                    fromId = f"!{src & 0xffffffff:08x}"
+            txt = self._extract_text(packet)
+            if not fromId or txt is None:
+                return
+            self.last_rx_at = time.time()
 
-        # Rate limit
-        t = self.last_seen.get(fromId, 0)
-        if time.time() - t < RATE_SEC:
-            return
-        self.last_seen[fromId] = time.time()
+            low = txt.strip()
+            dlog(f"[recv] {fromId} ch=0: {low}")
 
-        low = txt.strip()
-        if low.startswith(SYNC_TAG):
-            self._handle_sync(fromId, low)
-            return
+            # deliver queued DMs if this node appeared
+            self._deliver_queued(fromId)
 
-        # ignore blacklisted
-        if self.db.execute("SELECT 1 FROM blacklist WHERE id=?", (fromId,)).fetchone():
-            return
+            # peer sync first
+            if low.startswith(SYNC_TAG):
+                self._handle_sync(fromId, low); return
 
-        # Menu triggers
-        if low == "?" or low.lower() == "menu":
-            self._cmd_menu(fromId); return
-        if low == "??" or low.lower() == "help":
-            self._cmd_help(fromId); return
+            # blacklisted?
+            if self.db.execute("SELECT 1 FROM blacklist WHERE id=?", (fromId,)).fetchone():
+                dlog(f"[drop] blacklisted {fromId}")
+                return
 
-        # Commands parsing
-        tok = low.split()
-        if not tok: return
-        cmd = tok[0].lower()
+            # menu/help bypass rate limit
+            if low in ("?","??","menu","help"):
+                (self._cmd_menu if low in ("?","menu") else self._cmd_help)(fromId)
+                return
 
-        # Read
-        if cmd == "r":
-            self._cmd_read(fromId, tok[1] if len(tok) > 1 else None); return
+            # rate limit for everything else
+            tprev = self.last_seen.get(fromId, 0.0)
+            if time.time() - tprev < RATE_SEC:
+                dlog(f"[rate] {fromId} suppressed ({time.time()-tprev:.2f}s < {RATE_SEC}s)")
+                return
+            self.last_seen[fromId] = time.time()
 
-        # Post
-        if cmd == "p" or cmd == "post":
-            if len(tok) >= 2:
-                self._cmd_post(fromId, fromId, low[len(tok[0]):].strip())
-            else:
-                self._send_text(fromId, "usage: p <text>")
-            return
+            # parse commands
+            tok = low.split()
+            if not tok: return
+            cmd = tok[0].lower()
 
-        # Reply
-        if cmd == "reply" and len(tok) >= 3:
-            self._cmd_reply(fromId, fromId, tok[1], low.split(None,2)[2]); return
+            if cmd == "r":
+                self._cmd_read(fromId, tok[1] if len(tok) > 1 else None); return
+            if cmd in ("p","post"):
+                if len(tok) >= 2:
+                    self._cmd_post(fromId, fromId, low[len(tok[0]):].strip())
+                else:
+                    self._send_text(fromId, "usage: p <text>")
+                return
+            if cmd == "reply" and len(tok) >= 3:
+                self._cmd_reply(fromId, fromId, tok[1], low.split(None,2)[2]); return
+            if cmd == "info":
+                self._cmd_info(fromId, tok[1:], fromId); return
+            if cmd == "status": self._cmd_status(fromId); return
+            if cmd == "whoami": self._cmd_whoami(fromId, fromId); return
+            if cmd == "whois" and len(tok)>=2: self._cmd_whois(fromId, tok[1]); return
+            if cmd == "nodes": self._cmd_nodes(fromId); return
+            if cmd == "dm" and len(tok)>=3: self._cmd_dm(fromId, tok[1], *tok[2:]); return
+            if cmd == "health": self._cmd_health(fromId, tok[1:], fromId); return
 
-        # Info
-        if cmd == "info":
-            self._cmd_info(fromId, tok[1:], fromId); return
-
-        # Status / whoami / whois / nodes / dm / health
-        if cmd == "status": self._cmd_status(fromId); return
-        if cmd == "whoami": self._cmd_whoami(fromId, fromId); return
-        if cmd == "whois" and len(tok)>=2: self._cmd_whois(fromId, tok[1]); return
-        if cmd == "nodes": self._cmd_nodes(fromId); return
-        if cmd == "dm" and len(tok)>=3: self._cmd_dm(fromId, tok[1], *tok[2:]); return
-        if cmd == "health": self._cmd_health(fromId, tok[1:], fromId); return
-
-        # Admin / blacklist
-        if cmd == "admins" and len(tok)>=2 and self._is_admin(fromId):
-            act = tok[1]
-            if act == "add" and len(tok)>=3: self._admin_add(tok[2]); self._send_text(fromId, "admin added"); return
-            if act == "del" and len(tok)>=3: self.db.execute("DELETE FROM admins WHERE id=?", (tok[2],)); self.db.commit(); self._send_text(fromId, "admin removed"); return
-            if act == "list":
-                lines = [r["id"] for r in self.db.execute("SELECT id FROM admins ORDER BY id")]
-                self._send_paged(fromId, lines or ["(none)"], title="[admins]"); return
-
-        if cmd == "bl" and len(tok)>=2 and self._is_admin(fromId):
-            act = tok[1]
-            if act == "add" and len(tok)>=3: self.db.execute("INSERT OR IGNORE INTO blacklist(id) VALUES(?)",(tok[2],)); self.db.commit(); self._send_text(fromId,"blacklisted"); return
-            if act == "del" and len(tok)>=3: self.db.execute("DELETE FROM blacklist WHERE id=?", (tok[2],)); self.db.commit(); self._send_text(fromId,"removed"); return
-            if act == "list":
-                lines = [r["id"] for r in self.db.execute("SELECT id FROM blacklist ORDER BY id")]
-                self._send_paged(fromId, lines or ["(none)"], title="[blacklist]"); return
-
-        # Peers & sync (admin)
-        if self._is_admin(fromId):
-            if cmd == "peer" and len(tok)>=2:
+            # Admin / blacklist
+            if cmd == "admins" and len(tok)>=2 and self._is_admin(fromId):
                 act = tok[1]
-                if act == "add" and len(tok)>=3: self._peer_add(tok[2]); self._send_text(fromId,"peer added"); return
-                if act == "del" and len(tok)>=3: self.db.execute("DELETE FROM peers WHERE id=?", (tok[2],)); self.db.commit(); self._send_text(fromId,"peer removed"); return
-                if act == "list": self._send_paged(fromId, self._peer_list() or ["(none)"], title="[peers]"); return
-            if cmd == "sync" and len(tok)>=2:
-                act = tok[1]
-                if act == "now": self._broadcast_inventory(); self._send_text(fromId,"sync announced"); return
-                if act == "on": self.sync_enabled = True; self._send_text(fromId, "sync on"); return
-                if act == "off": self.sync_enabled = False; self._send_text(fromId, "sync off"); return
+                if act == "add" and len(tok)>=3: self._admin_add(tok[2]); self._send_text(fromId, "admin added"); return
+                if act == "del" and len(tok)>=3: self.db.execute("DELETE FROM admins WHERE id=?", (tok[2],)); self.db.commit(); self._send_text(fromId, "admin removed"); return
+                if act == "list":
+                    lines = [r["id"] for r in self.db.execute("SELECT id FROM admins ORDER BY id")]
+                    self._send_paged(fromId, lines or ["(none)"], title="[admins]"); return
 
-        # Unknown
-        self._send_text(fromId, "unknown. send ? for menu")
+            if cmd == "bl" and len(tok)>=2 and self._is_admin(fromId):
+                act = tok[1]
+                if act == "add" and len(tok)>=3: self.db.execute("INSERT OR IGNORE INTO blacklist(id) VALUES(?)",(tok[2],)); self.db.commit(); self._send_text(fromId,"blacklisted"); return
+                if act == "del" and len(tok)>=3: self.db.execute("DELETE FROM blacklist WHERE id=?", (tok[2],)); self.db.commit(); self._send_text(fromId,"removed"); return
+                if act == "list":
+                    lines = [r["id"] for r in self.db.execute("SELECT id FROM blacklist ORDER BY id")]
+                    self._send_paged(fromId, lines or ["(none)"], title="[blacklist]"); return
+
+            # Peers & sync (admin)
+            if self._is_admin(fromId):
+                if cmd == "peer" and len(tok)>=2:
+                    act = tok[1]
+                    if act == "add" and len(tok)>=3: self._peer_add(tok[2]); self._send_text(fromId,"peer added"); return
+                    if act == "del" and len(tok)>=3: self.db.execute("DELETE FROM peers WHERE id=?", (tok[2],)); self.db.commit(); self._send_text(fromId,"peer removed"); return
+                    if act == "list": self._send_paged(fromId, self._peer_list() or ["(none)"], title="[peers]"); return
+                if cmd == "sync" and len(tok)>=2:
+                    act = tok[1]
+                    if act == "now": self._broadcast_inventory(); self._send_text(fromId,"sync announced"); return
+                    if act == "on": self.sync_enabled = True; self._send_text(fromId, "sync on"); return
+                    if act == "off": self.sync_enabled = False; self._send_text(fromId, "sync off"); return
+
+            self._send_text(fromId, "unknown. send ? for menu")
+        except Exception as e:
+            print(f"[meshmini] onReceive error: {e}", flush=True)
+
+    # ---------- Watchdog ----------
+    def _watch_loop(self):
+        while not self.stop_evt.wait(WATCH_TICK):
+            try:
+                stale = (time.time() - self.last_rx_at) > RX_STALE_SEC if self.last_rx_at else False
+                if stale:
+                    dlog(f"[meshmini] RX stale > {RX_STALE_SEC}s; triggering reconnect")
+                    self._reconnect()
+            except Exception as e:
+                print(f"[meshmini] watchdog error: {e}")
 
     # ---------- Lifecycle ----------
     def start(self):
         self._connect()
-        # Start sync timer
         if self.sync_thread is None:
             self.sync_thread = threading.Thread(target=self._sync_loop, daemon=True)
             self.sync_thread.start()
-        # Keep process alive
+        if self.watch_thread is None:
+            self.watch_thread = threading.Thread(target=self._watch_loop, daemon=True)
+            self.watch_thread.start()
         try:
             while True:
                 time.sleep(1.0)
@@ -592,8 +683,7 @@ class MiniBBS:
                 except: pass
 
 def main():
-    dev = DEVICE_PATH
-    MiniBBS(dev).start()
+    MiniBBS(DEVICE_PATH).start()
 
 if __name__ == "__main__":
     main()
