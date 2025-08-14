@@ -1,33 +1,49 @@
-# MeshMini — Admin Guide
+# Admin Guide
 
-### First steps
-- Add yourself as an admin via install `--admins "!yourid"` or on-air:
-  - `admins add !yourid`
-
-### Admin commands
+## Make yourself admin
+Provide your node id (`!xxxxxxxx`) to the installer via `--admins`. Or later:
 ```
-admins add <!id> | admins del <!id> | admins list
-bl add <!id>     | bl del <!id>     | bl list
-peer add <!id>   | peer del <!id>   | peer list
-sync now | sync on | sync off
-info set <text>
+admins add !deadbeef
+```
+List/remove:
+```
+admins list
+admins del !deadbeef
 ```
 
-### Redundant BBS (peer sync)
-1. Add peer node IDs: `peer add !cafef00d`
-2. Trigger a sync: `sync now` (or wait SYNC_PERIOD).
-3. New posts replicate automatically; missing posts are pulled on demand.
+## Setting the notice
+```
+info set Road closed at Bridge St. Use detour via Main Rd.
+```
+- The timestamp in **Pacific/Auckland** is saved automatically.
+- Users see the notice when they send `?`, and when they send `info`.
 
-**Tune via environment** (edit `/etc/systemd/system/meshmini.service` and `sudo systemctl daemon-reload && sudo systemctl restart meshmini`):
+## Blacklist
 ```
-MMB_SYNC=1
-MMB_PEERS="!id1,!id2"
-MMB_SYNC_INV=15
-MMB_SYNC_PERIOD=300
-MMB_SYNC_CHUNK=160
+bl add <!id>
+bl list
+bl del <!id>
 ```
 
-### Logs
+## Peers & sync (optional redundancy)
+Add peer BBS node IDs:
 ```
-sudo journalctl -u meshmini -f
+peer add !11111111
+peer list
+peer del !11111111
 ```
+Trigger an inventory push:
+```
+sync now
+```
+Toggle:
+```
+sync on
+sync off
+```
+
+## Health check
+```
+health
+```
+Shows device link, counts, last inventory push, etc.
