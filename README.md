@@ -1,4 +1,4 @@
-# MeshMini (v0.8 — Health)
+# MeshMini
 
 Adds a tiny `health` command on top of v0.7 (peer sync).
 
