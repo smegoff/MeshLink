@@ -1,39 +1,35 @@
-# MeshMini — a tiny Meshtastic message board
+# MeshMini
 
-**MeshMini** is a minimal, reliable message board (not a full BBS) for Meshtastic networks.
+**MeshMini** is a tiny, robust message board + tools service for [Meshtastic](https://meshtastic.org/) radios. It focuses on **simplicity, reliability**, and **admin basics** — not a full retro BBS.
 
-- ✅ Post / read / reply
-- ✅ One-line **notice** shown before the menu
-- ✅ Compact `?` menu in a single message; `??` for detailed help
-- ✅ Store-and-forward **DM** to a node by **short name**
-- ✅ Admin & blacklist controls
-- ✅ Optional **peer sync** between multiple BBS nodes (inventory + chunked post replication)
-- ✅ SQLite persistence
-- ✅ **Watchdog** auto-reconnect + optional PubSub fallback for receive path
+- Post & read messages (with replies)
+- One-line `?` menu (auto-shrinks to fit your radio’s text budget)
+- Notice board (`info`) shown before the menu if set
+- Store-&-forward DMs (by node **short name**)
+- Clean `nodes` listing; `whois <short>` lookup
+- Admin controls (admins, blacklist)
+- Peer sync between multiple BBS nodes (optional)
+- RX watchdog: auto-reconnect if radio goes quiet
 
-MIT-licensed and designed to be deployed on a headless Raspberry Pi connected to a Meshtastic node via USB.
-
----
-
-## Quick start (Raspberry Pi)
+## Quick Start (Raspberry Pi + USB Meshtastic)
 
 ```bash
-# 1) Install system deps
+# 1) Install system deps (Debian/RPi OS)
 sudo apt-get update
-sudo apt-get install -y python3-venv python3-pip sqlite3
+sudo apt-get install -y python3 python3-venv
 
-# 2) App layout
+# 2) App dir & venv
 sudo mkdir -p /opt/meshmini
-sudo chown -R $USER:$USER /opt/meshmini
+sudo chown $USER:$USER /opt/meshmini
 python3 -m venv /opt/meshmini/venv
 /opt/meshmini/venv/bin/pip install --upgrade pip
 /opt/meshmini/venv/bin/pip install meshtastic pypubsub
 
-# 3) Drop the app file
-nano /opt/meshmini/meshmini.py
-# (paste the file from this repo)
+# 3) Put meshmini.py in place (see repo file)
+#    and make sure it's executable:
+chmod +x /opt/meshmini/meshmini.py
 
-# 4) Systemd service (replace <user> with your username)
+# 4) Create a systemd unit
 sudo tee /etc/systemd/system/meshmini.service >/dev/null <<'UNIT'
 [Unit]
 Description=MeshMini - minimal Meshtastic BBS
@@ -41,34 +37,24 @@ After=network.target
 
 [Service]
 Type=simple
-User=<user>
-Group=<user>
+User=pi
+Group=pi
 WorkingDirectory=/opt/meshmini
 
-# Runtime config
+# Core config
 Environment=PYTHONUNBUFFERED=1
 Environment=MMB_DB=/opt/meshmini/board.db
 Environment=MMB_DEVICE=auto
 Environment=MMB_NAME=MeshLink BBS
-# Optional: initial admins (comma-separated Meshtastic IDs like !ba654c8c)
-# Environment=MMB_ADMINS=!deadbeef,!cafef00d
+# Optional: comma-separated admin IDs, e.g. !cafef00d,!deadbeef
+# Environment=MMB_ADMINS=!cafef00d
 
-# Behavior knobs
-Environment=MMB_MAX_TEXT=140
+# Behavior knobs (tweak as desired)
 Environment=MMB_RATE=2
-Environment=MMB_HEALTH_PUBLIC=1
-Environment=MMB_DEBUG=0
-
-# Peer sync (optional)
+Environment=MMB_MAX_TEXT=160
+Environment=MMB_HEALTH_PUBLIC=0
 Environment=MMB_SYNC=1
-# Environment=MMB_PEERS=!11223344,!a1b2c3d4
-Environment=MMB_SYNC_PERIOD=300
-Environment=MMB_SYNC_INV=15
-Environment=MMB_SYNC_CHUNK=160
-
-# Watchdog
-Environment=MMB_RX_STALE_SEC=240
-Environment=MMB_WATCH_TICK=10
+# Environment=MMB_PEERS=!peer1,!peer2
 
 ExecStart=/opt/meshmini/venv/bin/python /opt/meshmini/meshmini.py
 Restart=always
@@ -78,6 +64,7 @@ RestartSec=5
 WantedBy=multi-user.target
 UNIT
 
+# 5) Enable + start
 sudo systemctl daemon-reload
 sudo systemctl enable --now meshmini
-sudo journalctl -u meshmini -f --no-pager
+sudo journalctl -u meshmini -f
