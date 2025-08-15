@@ -1,4 +1,4 @@
-# MeshMini Cheat Sheet (A4)
+# MeshMini Cheat Sheet
 
 **Menu**
 - `?`  — notice (if set) + compact menu
