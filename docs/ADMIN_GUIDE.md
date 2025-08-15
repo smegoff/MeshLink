@@ -112,3 +112,101 @@ systemctl cat meshmini
 
 # Enable at boot
 sudo systemctl enable meshmini
+8) Configuration (environment file)
+
+Edit /etc/meshmini/meshmini.env (recommended), then:
+
+sudo systemctl restart meshmini
+
+Common settings:
+
+Variable	Default	Purpose
+MMB_DB	/opt/meshmini/board.db	SQLite DB path
+MMB_DEVICE	auto	Serial device path or auto
+MMB_NAME	MeshLink BBS	BBS display name (shown in menu)
+MMB_ADMINS	(empty)	Comma-sep node IDs (e.g. !deadbeef,!cafef00d)
+MMB_RATE	2	Per-sender rate limit (seconds)
+MMB_MAX_TEXT	140	Max chars per outbound message
+MMB_HEALTH_PUBLIC	0	1 = allow anyone to run health
+MMB_DEBUG	0	1 = verbose debug logs
+MMB_UNKNOWN_REPLY	1	Reply to unknown text only; ignores acks/telemetry
+MMB_SYNC	1	Enable peer sync
+MMB_PEERS	(empty)	Comma-sep peer BBS node IDs
+MMB_SYNC_INV	15	Inventory size for broadcast
+MMB_SYNC_PERIOD	300	Seconds between inventory broadcasts
+MMB_SYNC_CHUNK	160	Bytes per chunk for post replication
+MMB_RX_STALE_SEC	240	Reconnect if no RX for N seconds
+MMB_WATCH_TICK	10	Watchdog poll interval (seconds)
+
+Unknown replies & noise: With MMB_UNKNOWN_REPLY=1, the service replies only to unknown text messages, ignoring system frames (acks, telemetry), reducing chatter.
+
+9) Maintenance
+
+DB backup:
+
+sudo systemctl stop meshmini
+sudo cp -a /opt/meshmini/board.db /opt/meshmini/board.db.bak.$(date +%F)
+sudo systemctl start meshmini
+
+Move DB (update MMB_DB and restart):
+
+sudo mkdir -p /var/lib/meshmini
+sudo mv /opt/meshmini/board.db /var/lib/meshmini/board.db
+echo 'MMB_DB=/var/lib/meshmini/board.db' | sudo tee -a /etc/meshmini/meshmini.env
+sudo systemctl restart meshmini
+
+10) Troubleshooting
+
+“Could not exclusively lock port /dev/ttyACM0”
+Another process is using the serial port. Stop other Meshtastic tools, then:
+
+sudo lsof /dev/ttyACM0
+
+Ensure only meshmini holds the port.
+
+“Timed out waiting for connection completion”
+Cable/port problem or device not ready. Try another USB cable/port; power cycle the radio; check MMB_DEVICE.
+
+No response to ?
+Check logs: sudo journalctl -u meshmini -f
+Verify service is running and your node is on the same channel. Rate limit might be suppressing repeats — wait a couple seconds.
+
+Menu split across many pages
+MMB_MAX_TEXT is usually 140 on Meshtastic; the menu auto-shrinks, but if you’ve lowered the max text size in firmware/channels, consider raising it here or accept the compact fallback.
+
+Too much “unknown. send ? for menu” noise
+Ensure MMB_UNKNOWN_REPLY=1 (default) so the service only replies to unknown text, not acks/telemetry. You can also set it to 0 to silence unknown replies entirely.
+
+Nodes shows 0
+Your radio may not have a current node list; wait for traffic, or reboot nodes so they announce.
+
+11) Security tips
+
+Keep admin list tight (MMB_ADMINS + admins add/del).
+
+Use blacklist to silence abusers/noisy devices.
+
+If exposing logs, beware they can include message content.
+
+Consider moving board.db to a backed-up location.
+
+12) License
+
+MeshMini is typically released under the MIT License. Include LICENSE in your repo for clarity.
+
+13) Quick reference (cheat sheet)
+
+? → notice + menu  ?? → full help
+
+Posts: r, r <id>, p <text>, reply <id> <text>
+
+Info: info, info set <text> or info set <hours> <text>
+
+People: whoami, nodes, whois <short>, dm <short> <text>
+
+Admin: admins add|del <!id>, admins list, bl add|del <!id>, bl list
+
+Peers: peer add|del <!id>, peer list, sync on|off|now
+
+Health: health
+MD
