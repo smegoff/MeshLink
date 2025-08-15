@@ -24,7 +24,7 @@
 
 ```bash
 # 1) Clone
-git clone https://github.com/<you>/meshmini.git
+git clone https://github.com/smegoff/meshlink.git
 cd meshmini
 
 # 2) Install (creates /opt/meshmini, venv, systemd service)
