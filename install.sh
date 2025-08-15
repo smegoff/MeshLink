@@ -9,70 +9,77 @@ PEERS=""
 
 usage() {
   cat <<EOF
-Usage: sudo bash install.sh --user <username> [--device auto|/dev/ttyACM0] [--name "MeshLink BBS"] [--admins "!deadbeef,!cafef00d"] [--peers "!11111111,!22222222"]
-Installs MeshMini to /opt/meshmini and sets up a systemd service (with /etc/meshmini/meshmini.env).
+Usage:
+  sudo bash install.sh --user <username> [--device auto|/dev/ttyACM0] [--name "MeshLink BBS"] \
+    [--admins "!deadbeef,!cafef00d"] [--peers "!11111111,!22222222"]
+
+Installs MeshMini to /opt/meshmini and sets up a systemd service + /etc/meshmini/meshmini.env
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --user)   USER_NAME="${2}"; shift 2;;
-    --device) DEVICE="${2}"; shift 2;;
-    --name)   NAME="${2}"; shift 2;;
-    --admins) ADMINS="${2}"; shift 2;;
-    --peers)  PEERS="${2}"; shift 2;;
+    --user)   USER_NAME="$2"; shift 2;;
+    --device) DEVICE="$2"; shift 2;;
+    --name)   NAME="$2"; shift 2;;
+    --admins) ADMINS="$2"; shift 2;;
+    --peers)  PEERS="$2"; shift 2;;
     -h|--help) usage; exit 0;;
     *) echo "Unknown arg: $1"; usage; exit 1;;
   esac
 done
 
-if [[ -z "${USER_NAME}" ]]; then
-  echo "Missing --user"; usage; exit 1
-fi
+[[ -n "$USER_NAME" ]] || { echo "Missing --user"; usage; exit 1; }
 
 APP_DIR=/opt/meshmini
 VENV=${APP_DIR}/venv
-PY=${VENV}/bin/python
-PIP=${VENV}/bin/pip
+SERVICE=/etc/systemd/system/meshmini.service
+ENV_DIR=/etc/meshmini
+ENV_FILE=${ENV_DIR}/meshmini.env
 
-echo "[1/6] Creating app dir and copying script…"
-install -d -o "${USER_NAME}" -g "${USER_NAME}" "${APP_DIR}"
-install -m 0755 meshmini.py "${APP_DIR}/meshmini.py"
-chown "${USER_NAME}:${USER_NAME}" "${APP_DIR}/meshmini.py"
+echo "[1/6] OS deps"
+apt-get update -y
+apt-get install -y python3-venv
 
-echo "[2/6] Python venv + packages…"
-python3 -m venv "${VENV}" || true
-"${PIP}" install --upgrade pip
-"${PIP}" install meshtastic pypubsub
+echo "[2/6] App dir + venv"
+install -d -o "$USER_NAME" -g "$USER_NAME" "$APP_DIR"
+python3 -m venv "$VENV"
+"$VENV/bin/pip" install --upgrade pip
+"$VENV/bin/pip" install meshtastic pypubsub pytz
 
-echo "[3/6] Add ${USER_NAME} to 'dialout' (serial)…"
-id "${USER_NAME}" &>/dev/null && usermod -aG dialout "${USER_NAME}" || true
+echo "[3/6] Copy meshmini.py"
+install -m 0755 -o "$USER_NAME" -g "$USER_NAME" meshmini.py "$APP_DIR/meshmini.py"
 
-echo "[4/6] Environment file…"
-install -d /etc/meshmini
-ENVF=/etc/meshmini/meshmini.env
-cat > "${ENVF}" <<EOF
-PYTHONUNBUFFERED=1
-MMB_DB=/opt/meshmini/board.db
+echo "[4/6] Env file"
+install -d -m 0755 "$ENV_DIR"
+cat >"$ENV_FILE" <<ENV
+# MeshMini runtime env
+MMB_DB=${APP_DIR}/board.db
 MMB_DEVICE=${DEVICE}
 MMB_NAME=${NAME}
 MMB_ADMINS=${ADMINS}
-MMB_MAX_TEXT=140
+MMB_PEERS=${PEERS}
 MMB_RATE=2
-MMB_HEALTH_PUBLIC=1
+MMB_MAX_TEXT=140
+MMB_HEALTH_PUBLIC=0
 MMB_DEBUG=0
 MMB_SYNC=1
-MMB_PEERS=${PEERS}
 MMB_SYNC_PERIOD=300
 MMB_SYNC_INV=15
 MMB_SYNC_CHUNK=160
 MMB_RX_STALE_SEC=240
 MMB_WATCH_TICK=10
-EOF
+MMB_TZ=Pacific/Auckland
+# Optional notice expiry (choose one)
+# MMB_INFO_TTL_MIN=180
+# MMB_INFO_UNTIL=2025-08-20 18:00
+# Unknown reply behavior
+MMB_UNKNOWN_REPLY=1
+ENV
+chmod 0644 "$ENV_FILE"
 
-echo "[5/6] systemd unit…"
-SERVICE=/etc/systemd/system/meshmini.service
-cat > "${SERVICE}" <<UNIT
+echo "[5/6] Systemd unit"
+cat >"$SERVICE" <<UNIT
 [Unit]
 Description=MeshMini - minimal Meshtastic BBS
 After=network.target
@@ -81,9 +88,9 @@ After=network.target
 Type=simple
 User=${USER_NAME}
 Group=${USER_NAME}
-WorkingDirectory=/opt/meshmini
-EnvironmentFile=/etc/meshmini/meshmini.env
-ExecStart=/opt/meshmini/venv/bin/python /opt/meshmini/meshmini.py
+WorkingDirectory=${APP_DIR}
+EnvironmentFile=${ENV_FILE}
+ExecStart=${VENV}/bin/python ${APP_DIR}/meshmini.py
 Restart=always
 RestartSec=5
 
@@ -91,8 +98,10 @@ RestartSec=5
 WantedBy=multi-user.target
 UNIT
 
+echo "[6/6] Enable service"
 systemctl daemon-reload
-systemctl enable meshmini.service
-systemctl restart meshmini.service
+systemctl enable --now meshmini
 
-echo "Done. Tail logs: sudo journalctl -u meshmini -f --no-pager"
+echo
+echo "Done. Logs:   sudo journalctl -u meshmini -f"
+echo "Edit env:     sudo nano ${ENV_FILE}  (then: sudo systemctl restart meshmini)"
