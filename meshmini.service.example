@@ -1,0 +1,16 @@
+[Unit]
+Description=MeshMini - minimal Meshtastic BBS
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/opt/meshmini
+EnvironmentFile=/etc/meshmini/meshmini.env
+ExecStart=/opt/meshmini/venv/bin/python /opt/meshmini/meshmini.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
